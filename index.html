@@ -111,7 +111,7 @@
 
       // Dimensions et masses (bois de bouleau ≈ 650 kg/m³)
       const PIN_R = 0.038;
-      const PIN_MASS = 0.21;           // kg
+      const PIN_MASS = 0.17;           // kg
       const STICK_W = 0.05;
       const STICK_LEN = 0.38;
       const STICK_MASS = 0.34;         // kg
@@ -164,7 +164,7 @@
         b.addShape(new CANNON.Cylinder(PIN_R, PIN_R, h, 16), new CANNON.Vec3(), Z_TO_Y);
         b.collisionFilterGroup = G_PIN;
         b.collisionFilterMask = G_GROUND | G_PIN | G_STICK;
-        tune(b, 0.1, 0.6);
+        tune(b, 0.05, 0.35);             // freinage réduit : les quilles basculent plus vivement
         b.position.set(x, h / 2, z);
         world.addBody(b);
         b.sleep();

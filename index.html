@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Mölkky VR</title>
   <script src="https://cdn.jsdelivr.net/npm/aframe@1.5.0/dist/aframe-master.min.js"></script>
+  <!-- Moteur physique (corps rigides, collisions, frottements, rebonds) -->
+  <script src="https://cdn.jsdelivr.net/npm/cannon@0.6.2/build/cannon.min.js"></script>
   <style>
     :root { --panel: rgba(20, 16, 14, 0.85); --ink: #f4ecdf; }
     * { box-sizing: border-box; }
@@ -64,9 +66,7 @@
       width="0.05"
       height="0.05"
       depth="0.38"
-      color="#c98a4b"
-      position="0 0.05 -0.6"
-      rotation="0 90 0">
+      color="#c98a4b">
     </a-box>
 
     <!-- Joueur (Camera Rig) -->
@@ -103,6 +103,181 @@
 
   </a-scene>
 
+  <!-- ===== Monde physique (indépendant d'A-Frame) ===== -->
+  <script id="physics-core">
+    const PHYS = (function () {
+      // Groupes de collision
+      const G_GROUND = 1, G_PIN = 2, G_STICK = 4;
+
+      // Dimensions et masses (bois de bouleau ≈ 650 kg/m³)
+      const PIN_R = 0.038;
+      const PIN_MASS = 0.25;           // kg
+      const STICK_W = 0.05;
+      const STICK_LEN = 0.38;
+      const STICK_MASS = 0.4;          // kg
+
+      const FIXED_STEP = 1 / 300;      // petit pas fixe : pas de barre qui traverse une quille
+      const MAX_SUBSTEPS = 20;
+      const FALLEN_UP_Y = 0.5;         // quille tombée si inclinée de plus de 60°
+
+      const world = new CANNON.World();
+      world.gravity.set(0, -9.82, 0);
+      world.broadphase = new CANNON.NaiveBroadphase();
+      world.solver.iterations = 20;
+      world.allowSleep = true;         // les objets immobiles "dorment" : pas de tremblement
+
+      // Matériaux : bois contre bois, bois contre herbe
+      const wood = new CANNON.Material('bois');
+      const grass = new CANNON.Material('herbe');
+      world.addContactMaterial(new CANNON.ContactMaterial(wood, wood, {
+        friction: 0.35, restitution: 0.3,
+        contactEquationStiffness: 1e7, contactEquationRelaxation: 3
+      }));
+      world.addContactMaterial(new CANNON.ContactMaterial(wood, grass, {
+        friction: 0.6, restitution: 0.12,
+        contactEquationStiffness: 1e7, contactEquationRelaxation: 3
+      }));
+
+      // Sol
+      const ground = new CANNON.Body({ mass: 0, material: grass });
+      ground.addShape(new CANNON.Plane());
+      ground.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
+      ground.collisionFilterGroup = G_GROUND;
+      ground.collisionFilterMask = G_PIN | G_STICK;
+      world.addBody(ground);
+
+      const UP = new CANNON.Vec3(0, 1, 0);
+      const Z_TO_Y = new CANNON.Quaternion();
+      Z_TO_Y.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2); // le cylindre de cannon est sur Z
+      const tmp = new CANNON.Vec3();
+
+      function tune(b, linDamp, angDamp) {
+        b.linearDamping = linDamp;       // un peu de résistance de l'air / de l'herbe
+        b.angularDamping = angDamp;      // l'herbe freine le roulement
+        b.allowSleep = true;
+        b.sleepSpeedLimit = 0.05;
+        b.sleepTimeLimit = 0.4;
+      }
+
+      function makePin(x, z, h) {
+        const b = new CANNON.Body({ mass: PIN_MASS, material: wood });
+        b.addShape(new CANNON.Cylinder(PIN_R, PIN_R, h, 16), new CANNON.Vec3(), Z_TO_Y);
+        b.collisionFilterGroup = G_PIN;
+        b.collisionFilterMask = G_GROUND | G_PIN | G_STICK;
+        tune(b, 0.1, 0.6);
+        b.position.set(x, h / 2, z);
+        world.addBody(b);
+        b.sleep();
+        return b;
+      }
+
+      function makeStick(x, z, yaw) {
+        const b = new CANNON.Body({ mass: STICK_MASS, material: wood });
+        b.addShape(new CANNON.Box(new CANNON.Vec3(STICK_W / 2, STICK_W / 2, STICK_LEN / 2)));
+        b.collisionFilterGroup = G_STICK;
+        tune(b, 0.05, 0.4);
+        b.position.set(x, STICK_W / 2, z);
+        b.quaternion.setFromAxisAngle(UP, yaw);
+        world.addBody(b);
+        setStickHeld(b, false);
+        b.sleep();
+        return b;
+      }
+
+      // Barre tenue en main : elle suit la main et ne touche rien.
+      // Barre lâchée : objet physique normal.
+      function setStickHeld(b, held) {
+        b.velocity.set(0, 0, 0);
+        b.angularVelocity.set(0, 0, 0);
+        if (held) {
+          b.type = CANNON.Body.KINEMATIC;
+          b.collisionFilterMask = 0;
+        } else {
+          b.type = CANNON.Body.DYNAMIC;
+          b.collisionFilterMask = G_GROUND | G_PIN;
+          b.wakeUp();
+        }
+      }
+
+      function step(dt) {
+        world.step(FIXED_STEP, dt, MAX_SUBSTEPS);
+      }
+
+      function upVector(b) {
+        return b.quaternion.vmult(UP, tmp);
+      }
+
+      function isFallen(b) {
+        return upVector(b).y < FALLEN_UP_Y;
+      }
+
+      // Centre de la base de la quille, projeté au sol
+      function basePos(b, h) {
+        const up = upVector(b);
+        return { x: b.position.x - up.x * h / 2, z: b.position.z - up.z * h / 2 };
+      }
+
+      // Direction horizontale vers laquelle la quille est tombée (pour garder son orientation)
+      function fallYaw(b) {
+        const up = upVector(b);
+        return Math.atan2(up.x, up.z);
+      }
+
+      // Tout est-il immobile ?
+      function isStill(bodies) {
+        for (const b of bodies) {
+          if (b.type !== CANNON.Body.DYNAMIC || b.sleepState === CANNON.Body.SLEEPING) continue;
+          if (b.velocity.norm() > 0.04 || b.angularVelocity.norm() > 0.4) return false;
+        }
+        return true;
+      }
+
+      // Calcule où relever les quilles tombées : à l'endroit de leur base,
+      // en les écartant juste assez si deux bases se chevauchent.
+      function planRaise(pins) {
+        const MIN_D = 2 * PIN_R + 0.004;
+        const pts = pins.map(p => {
+          const s = basePos(p.body, p.h);
+          return { x: s.x, z: s.z, movable: p.fallen };
+        });
+        for (let it = 0; it < 30; it++) {
+          let moved = false;
+          for (let i = 0; i < pts.length; i++) {
+            for (let j = i + 1; j < pts.length; j++) {
+              const a = pts[i], c = pts[j];
+              if (!a.movable && !c.movable) continue;
+              let dx = c.x - a.x, dz = c.z - a.z;
+              let d = Math.hypot(dx, dz);
+              if (d >= MIN_D) continue;
+              if (d < 1e-6) { dx = Math.random() - 0.5; dz = Math.random() - 0.5; d = Math.hypot(dx, dz); }
+              const push = (MIN_D - d) / d;
+              const share = a.movable && c.movable ? 0.5 : 1;
+              if (a.movable) { a.x -= dx * push * share; a.z -= dz * push * share; }
+              if (c.movable) { c.x += dx * push * share; c.z += dz * push * share; }
+              moved = true;
+            }
+          }
+          if (!moved) break;
+        }
+        return pts;
+      }
+
+      // Pose une quille debout, immobile
+      function placeStanding(b, h, x, z, yaw) {
+        b.position.set(x, h / 2, z);
+        b.quaternion.setFromAxisAngle(UP, yaw);
+        b.velocity.set(0, 0, 0);
+        b.angularVelocity.set(0, 0, 0);
+      }
+
+      return {
+        world, PIN_R, STICK_W,
+        makePin, makeStick, setStickHeld, step,
+        isFallen, basePos, fallYaw, isStill, planRaise, placeStanding
+      };
+    })();
+  </script>
+
   <script>
     // Configuration du jeu : la quille 1 est à l'avant (z = -1.5), orientée vers le joueur en z = 0
     const LAYOUT = [
@@ -112,8 +287,7 @@
       [-0.45, -2.05, 7], [-0.15, -2.00, 8], [0.15, -2.00, 9], [0.45, -2.05, 10],
       [-0.60, -2.25, 11], [0.60, -2.25, 12]
     ];
-    const HIT_R = 0.09;   // distance max barre-quille pour la faire tomber (la barre compte sur toute sa longueur)
-    const PIN_R = 0.038;  // rayon des quilles (sert aussi à les poser au sol quand elles sont couchées)
+    const STICK_START = { x: 0, z: -0.6, yaw: Math.PI / 2 };
 
     let pins = [];
 
@@ -225,7 +399,7 @@
       if (k === 'd') wasd.keys.KeyD = false;
     });
 
-    // ===== Quilles =====
+    // ===== Quilles (visuel + corps physique) =====
     function buildPins() {
       const wrap = $('pins');
       wrap.innerHTML = '';
@@ -233,14 +407,12 @@
 
       LAYOUT.forEach(([x, z, num]) => {
         const h = 0.15 + (num * 0.01);
+        // L'origine du groupe = le centre de la quille (comme le corps physique)
         const g = document.createElement('a-entity');
-        // L'origine du groupe = le centre de la base de la quille (pivot de la chute)
-        g.setAttribute('position', `${x} 0 ${z}`);
 
         const body = document.createElement('a-cylinder');
-        body.setAttribute('radius', PIN_R);
+        body.setAttribute('radius', PHYS.PIN_R);
         body.setAttribute('height', h);
-        body.setAttribute('position', `0 ${h / 2} 0`);
         body.setAttribute('color', '#dfb887');
         body.setAttribute('roughness', '0.6');
 
@@ -249,100 +421,61 @@
         label.setAttribute('align', 'center');
         label.setAttribute('color', '#2d1806');
         label.setAttribute('width', 2);
-        label.setAttribute('position', `0 ${h + 0.03} 0`);
+        label.setAttribute('position', `0 ${h / 2 + 0.002} 0`);   // posé sur le dessus
         label.setAttribute('rotation', '-90 0 0');
 
         g.appendChild(body);
         g.appendChild(label);
         wrap.appendChild(g);
-        pins.push({ el: g, x, z, num, yaw: 0, standing: true });
+
+        pins.push({ el: g, num, h, body: PHYS.makePin(x, z, h), fallen: false });
       });
     }
 
-    // La quille est poussée dans le sens du choc, sa base glisse un peu, puis elle
-    // bascule à plat autour de sa base. (p.x, p.z) devient l'endroit où la base s'est arrêtée.
-    //   vx, vz : vitesse horizontale de la barre au moment du choc
-    //   cx, cz : point de la barre le plus proche de la quille (point d'impact)
-    function knockPin(p, vx, vz, cx, cz) {
-      p.standing = false;
-
-      // Direction de la barre
-      const speed = Math.hypot(vx, vz);
-      const dx = speed > 0.001 ? vx / speed : 0;
-      const dz = speed > 0.001 ? vz / speed : 0;
-
-      // Direction point d'impact -> quille
-      let ox = p.x - cx, oz = p.z - cz;
-      const oLen = Math.hypot(ox, oz) || 1;
-      ox /= oLen; oz /= oLen;
-
-      // Direction de chute : mélange des deux
-      let fx = dx * 0.6 + ox * 0.4;
-      let fz = dz * 0.6 + oz * 0.4;
-      const fLen = Math.hypot(fx, fz) || 1;
-      fx /= fLen; fz /= fLen;
-
-      // Glissement de la base selon la vitesse de la barre (m/s), plafonné
-      const slide = 0.06 + Math.min(speed, 6) * 0.04 + Math.random() * 0.06;
-      p.x += fx * slide;
-      p.z += fz * slide;
-
-      // Rotation Y vers la direction de chute, puis bascule de 90° en X.
-      // A-Frame applique l'ordre YXZ : le haut de la quille part donc vers (fx, fz).
-      p.yaw = THREE.MathUtils.radToDeg(Math.atan2(fx, fz));
-
-      p.el.setAttribute('animation__pos',
-        `property: position; to: ${p.x} ${PIN_R} ${p.z}; dur: 300; easing: easeOutQuad`);
-      p.el.setAttribute('animation__rot',
-        `property: rotation; to: 90 ${p.yaw} 0; dur: 300; easing: easeOutQuad`);
+    function syncPins() {
+      pins.forEach(p => {
+        p.el.object3D.position.copy(p.body.position);
+        p.el.object3D.quaternion.copy(p.body.quaternion);
+      });
     }
 
-    // La quille se relève exactement là où sa base est tombée
-    function standPin(p) {
-      p.standing = true;
-      p.el.setAttribute('animation__pos',
-        `property: position; to: ${p.x} 0 ${p.z}; dur: 260; easing: easeOutQuad`);
-      p.el.setAttribute('animation__rot',
-        `property: rotation; to: 0 ${p.yaw} 0; dur: 260; easing: easeOutQuad`);
-    }
-
-    function showResult(n) {
-      $('statusMsg').textContent = n > 0
-        ? `${n} quille${n > 1 ? 's' : ''} tombée${n > 1 ? 's' : ''} !`
-        : 'Raté.';
-    }
-
-    function standAllPins() {
-      pins.forEach(p => { if (!p.standing) standPin(p); });
+    // Règle du Mölkky : une seule quille = sa valeur, plusieurs = leur nombre
+    function showResult(fallen) {
+      const n = fallen.length;
+      if (n === 0) { $('statusMsg').textContent = 'Raté. 0 point'; return; }
+      const nums = fallen.map(p => p.num).sort((a, b) => a - b).join(', ');
+      const points = n === 1 ? fallen[0].num : n;
+      $('statusMsg').textContent =
+        `${n} quille${n > 1 ? 's' : ''} tombée${n > 1 ? 's' : ''} (${nums}) : ${points} point${points > 1 ? 's' : ''}`;
     }
 
     // ===== Réglages du lancer =====
-    const GRAVITY = 9.8;
-    const FRICTION = 1.5;          // plus grand = la barre s'arrête plus vite au sol
-    const BOUNCE = 0.25;           // rebond au sol (0 = aucun)
-    const STICK_Y = 0.05;          // hauteur de la barre posée au sol
-    const BAR_HALF = 0.19;         // demi-longueur de la barre (m)
     const HOLD_DIST = 0.1;         // la barre est tenue un peu devant la main (m)
     const UP = new THREE.Vector3(0, 1, 0);
 
-    // ===== Composant de la barre =====
+    // ===== Composant de la barre + boucle de jeu =====
     AFRAME.registerComponent('molkky-stick', {
       schema: {
         grabDist: { default: 0.7 },       // distance horizontale pour l'attraper (m)
-        returnDelay: { default: 3000 },   // attente avant le retour (ms)
+        returnDelay: { default: 2500 },   // attente avant de relever les quilles (ms)
         boost: { default: 1.4 },          // multiplicateur de puissance du geste
-        maxSpeed: { default: 12 }         // vitesse maxi du lancer (m/s)
+        maxSpeed: { default: 12 },        // vitesse maxi du lancer (m/s)
+        maxSpin: { default: 20 }          // rotation maxi de la barre (rad/s)
       },
 
       init() {
-        // États : ground -> holding -> flying -> waiting -> returning -> ready -> holding ...
+        // États : ground -> holding -> flying -> waiting -> raising -> returning -> ready -> holding ...
         this.state = 'ground';
         this.hand = $('rightHand');
         this.vel = new THREE.Vector3();
+        this.spin = new THREE.Vector3();
         this.handPos = new THREE.Vector3();
         this.handPrev = new THREE.Vector3();
         this.handVel = new THREE.Vector3();
+        this.handAng = new THREE.Vector3();
         this.handQuat = new THREE.Quaternion();
+        this.handQuatPrev = new THREE.Quaternion();
+        this.dq = new THREE.Quaternion();
         this.dir = new THREE.Vector3();
         this.fwd = new THREE.Vector3(0, 0, -1);   // direction horizontale de la main
         this.tmp = new THREE.Vector3();
@@ -350,13 +483,18 @@
         this.from = new THREE.Vector3();
         this.fromQuat = new THREE.Quaternion();
         this.toQuat = new THREE.Quaternion();
-        this.hits = new Set();
         this.history = [];                        // vitesses récentes de la main
-        this.yaw = Math.PI / 2;                   // orientation de la barre (rotation Y)
+        this.yaw = STICK_START.yaw;               // orientation de la barre (rotation Y)
         this.timer = 0;
         this.flyTime = 0;
-        this.returnT = 0;
-        this.onGround = false;
+        this.stillTime = 0;
+        this.t = 0;
+        this.raise = [];
+
+        buildPins();
+        this.body = PHYS.makeStick(STICK_START.x, STICK_START.z, STICK_START.yaw);
+        this.syncStickFromBody();
+        syncPins();
 
         $('actionMsg').textContent = 'Attrape la barre au sol avec la main droite (gâchette)';
 
@@ -366,6 +504,17 @@
         h.addEventListener('triggerup', () => this.onUp(h));
         h.addEventListener('gripdown', () => this.onDown(h));
         h.addEventListener('gripup', () => this.onUp(h));
+      },
+
+      syncStickFromBody() {
+        this.el.object3D.position.copy(this.body.position);
+        this.el.object3D.quaternion.copy(this.body.quaternion);
+      },
+
+      syncBodyFromStick() {
+        const o = this.el.object3D;
+        this.body.position.set(o.position.x, o.position.y, o.position.z);
+        this.body.quaternion.set(o.quaternion.x, o.quaternion.y, o.quaternion.z, o.quaternion.w);
       },
 
       // ----- 1. Attraper / tenir la barre -----
@@ -379,6 +528,8 @@
           this.hand = h;
           this.readHand(0);
           this.handVel.set(0, 0, 0);
+          this.handAng.set(0, 0, 0);
+          PHYS.setStickHeld(this.body, true);
           this.state = 'holding';
           $('actionMsg').textContent = 'Balance le bras et relâche la gâchette pour lancer !';
         } else if (this.state === 'ready' && h === this.hand) {
@@ -391,18 +542,33 @@
         if (this.state === 'holding' && h === this.hand) this.throwStick();
       },
 
-      // Lit la main : position, vitesse, et direction horizontale (pour garder la barre à plat)
+      // Lit la main : position, vitesse, vitesse de rotation, direction horizontale
       readHand(dt) {
         this.hand.object3D.getWorldPosition(this.handPos);
         this.hand.object3D.getWorldQuaternion(this.handQuat);
 
         if (dt > 0) {
+          // vitesse linéaire
           this.tmp.copy(this.handPos).sub(this.handPrev).divideScalar(dt);
           this.handVel.lerp(this.tmp, 0.4);                 // lissage
-          this.history.push(this.handVel.clone());
+
+          // vitesse de rotation du poignet : dq = q_now * q_prev^-1
+          this.dq.copy(this.handQuatPrev).invert().premultiply(this.handQuat);
+          if (this.dq.w < 0) { this.dq.x *= -1; this.dq.y *= -1; this.dq.z *= -1; this.dq.w *= -1; }
+          const s = Math.sqrt(Math.max(0, 1 - this.dq.w * this.dq.w));
+          if (s > 1e-5) {
+            const angle = 2 * Math.acos(Math.min(1, this.dq.w));
+            this.tmp.set(this.dq.x / s, this.dq.y / s, this.dq.z / s).multiplyScalar(angle / dt);
+          } else {
+            this.tmp.set(0, 0, 0);
+          }
+          this.handAng.lerp(this.tmp, 0.4);
+
+          this.history.push({ v: this.handVel.clone(), w: this.handAng.clone() });
           if (this.history.length > 10) this.history.shift();
         }
         this.handPrev.copy(this.handPos);
+        this.handQuatPrev.copy(this.handQuat);
 
         // Barre horizontale, en travers de la direction où pointe la main
         this.dir.set(0, 0, -1).applyQuaternion(this.handQuat);
@@ -424,126 +590,123 @@
         const o = this.el.object3D;
         o.position.copy(this.holdPos(this.p));
         o.quaternion.setFromAxisAngle(UP, this.yaw);        // toujours à plat
+        this.syncBodyFromStick();
       },
 
-      // ----- 2. Lancer à la main -----
+      // ----- 2. Lancer : la barre devient un objet physique -----
       throwStick() {
         // On prend l'échantillon le plus rapide des dernières images :
         // la main ralentit au moment où on relâche la gâchette.
         let best = null, bestLen = 0;
-        this.history.forEach(v => {
-          const l = v.length();
-          if (l > bestLen) { bestLen = l; best = v; }
+        this.history.forEach(s => {
+          const l = s.v.length();
+          if (l > bestLen) { bestLen = l; best = s; }
         });
 
         this.vel.set(0, 0, 0);
-        if (best) this.vel.copy(best).multiplyScalar(this.data.boost);
+        this.spin.set(0, 0, 0);
+        if (best) {
+          this.vel.copy(best.v).multiplyScalar(this.data.boost);
+          this.spin.copy(best.w);
+        }
         const sp = this.vel.length();
         if (sp > this.data.maxSpeed) this.vel.multiplyScalar(this.data.maxSpeed / sp);
+        const sw = this.spin.length();
+        if (sw > this.data.maxSpin) this.spin.multiplyScalar(this.data.maxSpin / sw);
 
-        // La barre reste horizontale, en travers de la direction du lancer
+        // La barre part à plat, en travers de la direction du lancer
         const hs = Math.hypot(this.vel.x, this.vel.z);
         if (hs > 0.3) this.yaw = Math.atan2(this.vel.z, -this.vel.x);
         this.el.object3D.quaternion.setFromAxisAngle(UP, this.yaw);
+        this.syncBodyFromStick();
 
-        this.hits.clear();
+        PHYS.setStickHeld(this.body, false);
+        this.body.velocity.set(this.vel.x, this.vel.y, this.vel.z);
+        this.body.angularVelocity.set(this.spin.x, this.spin.y, this.spin.z);
+
         this.flyTime = 0;
-        this.onGround = false;
+        this.stillTime = 0;
         this.state = 'flying';
         $('statusMsg').textContent = 'Partie en cours';
         $('actionMsg').textContent = 'Lancé !';
       },
 
-      // Une petite étape de simulation (appelée plusieurs fois par image)
-      step(h) {
-        const o = this.el.object3D;
-
-        this.vel.y -= GRAVITY * h;
-        o.position.addScaledVector(this.vel, h);
-
-        // Contact avec le sol
-        if (o.position.y <= STICK_Y) {
-          o.position.y = STICK_Y;
-          if (this.vel.y < -1) {
-            // rebond
-            this.vel.y *= -BOUNCE;
-            this.vel.x *= 0.8;
-            this.vel.z *= 0.8;
-            this.onGround = false;
-          } else {
-            // la barre glisse
-            this.vel.y = 0;
-            this.onGround = true;
-            const f = Math.exp(-FRICTION * h);
-            this.vel.x *= f;
-            this.vel.z *= f;
-          }
-        } else {
-          this.onGround = false;
-        }
-
-        // Collisions : la barre compte sur toute sa longueur
-        const ax = Math.sin(this.yaw), az = Math.cos(this.yaw);
-        pins.forEach(p => {
-          if (!p.standing || this.hits.has(p.num)) return;
-          const pinH = 0.15 + p.num * 0.01;
-          if (o.position.y > pinH + 0.05) return;           // la barre passe au-dessus
-          const dx = p.x - o.position.x;
-          const dz = p.z - o.position.z;
-          const t = THREE.MathUtils.clamp(dx * ax + dz * az, -BAR_HALF, BAR_HALF);
-          const d = Math.hypot(dx - t * ax, dz - t * az);
-          if (d < HIT_R) {
-            this.hits.add(p.num);
-            // point d'impact = point de la barre le plus proche de la quille
-            const cx = o.position.x + t * ax;
-            const cz = o.position.z + t * az;
-            knockPin(p, this.vel.x, this.vel.z, cx, cz);
-            this.vel.x *= 0.75;
-            this.vel.z *= 0.75;
-          }
-        });
-      },
-
-      fly(dt) {
-        const o = this.el.object3D;
+      // On attend que tout soit immobile (barre et quilles) avant de compter
+      watchThrow(dt) {
         this.flyTime += dt;
-
-        const steps = Math.max(1, Math.ceil(dt / 0.008));   // évite de traverser les quilles
-        for (let i = 0; i < steps; i++) this.step(dt / steps);
-
-        // Fin du lancer
-        const slow = this.onGround && Math.hypot(this.vel.x, this.vel.z) < 0.08;
-        const out = Math.abs(o.position.x) > 15 || Math.abs(o.position.z) > 15;
-        if (slow || out || this.flyTime > 8) this.settle();
+        const bodies = [this.body, ...pins.map(p => p.body)];
+        this.stillTime = PHYS.isStill(bodies) ? this.stillTime + dt : 0;
+        if ((this.flyTime > 0.5 && this.stillTime > 0.4) || this.flyTime > 10) this.settle();
       },
 
       settle() {
         this.state = 'waiting';
         this.timer = 0;
-        this.vel.set(0, 0, 0);
-        showResult(this.hits.size);
-        $('actionMsg').textContent = 'La barre revient dans quelques secondes…';
+        pins.forEach(p => { p.fallen = PHYS.isFallen(p.body); });
+        showResult(pins.filter(p => p.fallen));
+        $('actionMsg').textContent = 'Les quilles se relèvent dans quelques secondes…';
       },
 
-      // ----- 3. Retour automatique dans la main -----
+      // ----- 3. Relever les quilles là où leur base est tombée -----
+      startRaise() {
+        // La barre ne doit plus rien toucher pendant qu'on relève les quilles
+        PHYS.setStickHeld(this.body, true);
+
+        const targets = PHYS.planRaise(pins);
+        this.raise = [];
+        pins.forEach((p, i) => {
+          if (!p.fallen) return;
+          const yaw = PHYS.fallYaw(p.body);
+          const to = new THREE.Vector3(targets[i].x, p.h / 2, targets[i].z);
+          const toQ = new THREE.Quaternion().setFromAxisAngle(UP, yaw);
+          this.raise.push({
+            p, yaw, to, toQ,
+            from: new THREE.Vector3().copy(p.body.position),
+            fromQ: new THREE.Quaternion().copy(p.body.quaternion)
+          });
+        });
+        this.t = 0;
+        this.state = 'raising';
+      },
+
+      raisePins(dt) {
+        this.t = Math.min(this.t + dt / 0.35, 1);
+        const e = this.t * this.t * (3 - 2 * this.t);
+        this.raise.forEach(r => {
+          const o = r.p.el.object3D;
+          o.position.lerpVectors(r.from, r.to, e);
+          o.quaternion.copy(r.fromQ).slerp(r.toQ, e);
+        });
+        if (this.t < 1) return;
+
+        this.raise.forEach(r => {
+          PHYS.placeStanding(r.p.body, r.p.h, r.to.x, r.to.z, r.yaw);
+          r.p.fallen = false;
+        });
+        // On réveille tout le monde : une quille qui s'appuyait sur une autre retombe naturellement
+        pins.forEach(p => p.body.wakeUp());
+        this.startReturn();
+      },
+
+      // ----- 4. Retour automatique de la barre dans la main -----
       startReturn() {
-        standAllPins();
         this.from.copy(this.el.object3D.position);
         this.fromQuat.copy(this.el.object3D.quaternion);
-        this.returnT = 0;
+        this.t = 0;
         this.state = 'returning';
       },
 
       returnToHand(dt) {
         const o = this.el.object3D;
-        this.returnT = Math.min(this.returnT + dt / 0.7, 1);       // 0,7 s de trajet
-        const e = this.returnT * this.returnT * (3 - 2 * this.returnT);
+        this.t = Math.min(this.t + dt / 0.7, 1);                   // 0,7 s de trajet
+        const e = this.t * this.t * (3 - 2 * this.t);
         this.holdPos(this.p);
         this.toQuat.setFromAxisAngle(UP, this.yaw);
         o.position.lerpVectors(this.from, this.p, e);
         o.position.y += Math.sin(Math.PI * e) * 0.3;                // petit arc
         o.quaternion.copy(this.fromQuat).slerp(this.toQuat, e);
-        if (this.returnT >= 1) {
+        this.syncBodyFromStick();
+        if (this.t >= 1) {
           this.state = 'ready';
           $('statusMsg').textContent = 'Partie en cours';
           $('actionMsg').textContent = 'Barre en main : maintiens la gâchette, puis relâche en lançant';
@@ -552,24 +715,30 @@
 
       tick(time, dtMs) {
         const dt = Math.min(dtMs / 1000, 0.05);
+
         switch (this.state) {
           case 'holding':
-            this.readHand(dt); this.followHand(); break;
           case 'ready':
             this.readHand(dt); this.followHand(); break;
-          case 'flying':
-            this.fly(dt); break;
           case 'waiting':
             this.timer += dtMs;
-            if (this.timer >= this.data.returnDelay) this.startReturn();
+            if (this.timer >= this.data.returnDelay) this.startRaise();
             break;
+          case 'raising':
+            this.raisePins(dt);
+            return;                                  // physique en pause pendant le relevage
           case 'returning':
             this.readHand(dt); this.returnToHand(dt); break;
         }
+
+        PHYS.step(dt);
+        syncPins();
+        if (this.state === 'ground' || this.state === 'flying' || this.state === 'waiting') {
+          this.syncStickFromBody();
+        }
+        if (this.state === 'flying') this.watchThrow(dt);
       }
     });
-
-    buildPins();
   </script>
 </body>
 </html>

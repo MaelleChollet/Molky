@@ -109,8 +109,9 @@
       // Dimensions officielles du Mölkky (bouleau)
       //   quilles : 15 cm de haut, Ø 5,9 cm, base plate, sommet biseauté à 45°
       //   bâton   : 22,5 cm de long, Ø 5,9 cm
-      const PIN_R = 0.0295;
-      const PIN_H = 0.15;              // hauteur du côté le plus haut
+      // (quilles agrandies d'environ 12 % par rapport à l'officiel : Ø 6,6 cm, 17 cm de haut)
+      const PIN_R = 0.033;
+      const PIN_H = 0.17;              // hauteur du côté le plus haut
       const PIN_CUT = Math.tan(45 * Math.PI / 180);   // pente du biseau
       const PIN_HM = PIN_H - PIN_R * PIN_CUT;         // hauteur au centre du biseau
       const PIN_MASS = 0.17;           // kg
@@ -210,7 +211,7 @@
         const b = new CANNON.Body({ mass: STICK_MASS, material: wood });
         b.addShape(new CANNON.Cylinder(STICK_R, STICK_R, STICK_LEN, 16));
         b.collisionFilterGroup = G_STICK;
-        tune(b, 0.05, 0.85);             // un cylindre roule : l'herbe le freine vite
+        tune(b, 0.01, 0.85);             // presque pas de frein dans l'air ; au sol, l'herbe freine le roulement
         b.position.set(x, STICK_R, z);
         b.quaternion.setFromAxisAngle(UP, yaw);
         world.addBody(b);
@@ -520,8 +521,8 @@
       schema: {
         grabDist: { default: 0.7 },       // distance horizontale pour l'attraper (m)
         returnDelay: { default: 1800 },   // attente avant de relever les quilles (ms)
-        boost: { default: 1.15 },         // multiplicateur de puissance du geste
-        maxSpeed: { default: 10 },        // vitesse maxi du lancer (m/s)
+        boost: { default: 1.5 },          // en VR on lance sans le poids réel : on amplifie le geste
+        maxSpeed: { default: 13 },        // vitesse maxi du lancer (m/s)
         spinScale: { default: 0.4 },      // part de la rotation du poignet transmise à la barre
         maxSpin: { default: 10 }          // rotation maxi de la barre (rad/s)
       },
@@ -623,9 +624,9 @@
         this.hand.object3D.getWorldQuaternion(this.handQuat);
 
         if (dt > 0) {
-          // vitesse linéaire
-          this.tmp.copy(this.handPos).sub(this.handPrev).divideScalar(dt);
-          this.handVel.lerp(this.tmp, 0.4);                 // lissage
+          // Vitesse instantanée de la main (sans lissage : le lissage faisait perdre
+          // une bonne partie de la vitesse au moment du lâcher)
+          this.handVel.copy(this.handPos).sub(this.handPrev).divideScalar(dt);
 
           // vitesse de rotation du poignet : dq = q_now * q_prev^-1
           this.dq.copy(this.handQuatPrev).invert().premultiply(this.handQuat);
@@ -633,14 +634,13 @@
           const s = Math.sqrt(Math.max(0, 1 - this.dq.w * this.dq.w));
           if (s > 1e-5) {
             const angle = 2 * Math.acos(Math.min(1, this.dq.w));
-            this.tmp.set(this.dq.x / s, this.dq.y / s, this.dq.z / s).multiplyScalar(angle / dt);
+            this.handAng.set(this.dq.x / s, this.dq.y / s, this.dq.z / s).multiplyScalar(angle / dt);
           } else {
-            this.tmp.set(0, 0, 0);
+            this.handAng.set(0, 0, 0);
           }
-          this.handAng.lerp(this.tmp, 0.4);
 
-          this.history.push({ v: this.handVel.clone(), w: this.handAng.clone() });
-          if (this.history.length > 8) this.history.shift();       // ≈ 0,1 s avant le lâcher
+          this.history.push({ v: this.handVel.clone(), w: this.handAng.clone(), dt });
+          if (this.history.length > 12) this.history.shift();      // ≈ 0,15 s avant le lâcher
         }
         this.handPrev.copy(this.handPos);
         this.handQuatPrev.copy(this.handQuat);
@@ -670,21 +670,36 @@
 
       // ----- 2. Lancer : la barre devient un objet physique -----
       throwStick() {
-        // On prend l'échantillon le plus rapide des dernières images :
-        // la main ralentit au moment où on relâche la gâchette.
-        let best = null, bestLen = 0;
-        this.history.forEach(s => {
-          const l = s.v.length();
-          if (l > bestLen) { bestLen = l; best = s; }
-        });
+        // Vitesse moyenne sur des fenêtres de 3 images (≈ 40 ms) : filtre le bruit du suivi
+        // sans retard. On garde la fenêtre la plus rapide des dernières images,
+        // car la main ralentit au moment où on relâche le bouton.
+        const H = this.history, W = Math.min(3, H.length);
+        const v = new THREE.Vector3(), w = new THREE.Vector3();
+        let bestV = null, bestW = null, bestLen = -1;
+        for (let i = W - 1; i < H.length; i++) {
+          v.set(0, 0, 0); w.set(0, 0, 0);
+          let t = 0;
+          for (let k = i - W + 1; k <= i; k++) {
+            v.addScaledVector(H[k].v, H[k].dt);
+            w.addScaledVector(H[k].w, H[k].dt);
+            t += H[k].dt;
+          }
+          v.divideScalar(t); w.divideScalar(t);
+          if (v.length() > bestLen) { bestLen = v.length(); bestV = v.clone(); bestW = w.clone(); }
+        }
 
         this.vel.set(0, 0, 0);
         this.spin.set(0, 0, 0);
-        if (best) {
-          this.vel.copy(best.v).multiplyScalar(this.data.boost);
+        if (bestV) {
+          // La barre est tenue devant la main : le poignet qui tourne la fait aller
+          // plus vite que la main (effet de levier, comme un vrai lancer)
+          this.tmp.set(this.fwd.x * HOLD_DIST, 0, this.fwd.z * HOLD_DIST);
+          bestV.add(new THREE.Vector3().crossVectors(bestW, this.tmp));
+
+          this.vel.copy(bestV).multiplyScalar(this.data.boost);
           // Le bras qui balance fait beaucoup tourner la manette : on n'en garde qu'une partie,
           // sinon la barre part en vrille et rebondit n'importe comment.
-          this.spin.copy(best.w).multiplyScalar(this.data.spinScale);
+          this.spin.copy(bestW).multiplyScalar(this.data.spinScale);
         }
         const sp = this.vel.length();
         if (sp > this.data.maxSpeed) this.vel.multiplyScalar(this.data.maxSpeed / sp);

@@ -112,12 +112,12 @@
       // Dimensions officielles du Mölkky (bouleau)
       //   quilles : 15 cm de haut, Ø 5,9 cm, base plate, sommet biseauté à 45°
       //   bâton   : 22,5 cm de long, Ø 5,9 cm
-      // (quilles agrandies d'environ 12 % par rapport à l'officiel : Ø 6,6 cm, 17 cm de haut)
-      const PIN_R = 0.033;
-      const PIN_H = 0.17;              // hauteur du côté le plus haut
+      // (quilles agrandies par rapport à l'officiel : Ø 7,4 cm, 20 cm de haut)
+      const PIN_R = 0.037;
+      const PIN_H = 0.20;              // hauteur du côté le plus haut
       const PIN_CUT = Math.tan(45 * Math.PI / 180);   // pente du biseau
       const PIN_HM = PIN_H - PIN_R * PIN_CUT;         // hauteur au centre du biseau
-      const PIN_MASS = 0.17;           // kg
+      const PIN_MASS = 0.15;           // kg
       const PIN_SEG = 14;              // facettes de la forme physique
       const STICK_R = 0.0295;
       const STICK_LEN = 0.225;
@@ -140,17 +140,21 @@
       world.solver.iterations = 20;
       world.allowSleep = true;         // les objets immobiles "dorment" : pas de tremblement
 
-      // Matériaux : bois contre bois, bois contre herbe
-      const wood = new CANNON.Material('bois');
+      // Matériaux : quilles, bâton, herbe
+      const WOOD_FRICTION = 0.35;          // bois contre bois
+      const WOOD_RESTITUTION = 0.5;        // bouleau dur : le choc "claque" et transmet bien l'énergie
+      const PIN_GRASS_FRICTION = 0.6;      // adhérence de la base des quilles dans l'herbe
+      const STICK_GRASS_FRICTION = 0.45;   // frottement du bâton qui glisse dans l'herbe
+      const pinWood = new CANNON.Material('quille');
+      const stickWood = new CANNON.Material('baton');
       const grass = new CANNON.Material('herbe');
-      world.addContactMaterial(new CANNON.ContactMaterial(wood, wood, {
-        friction: 0.35, restitution: 0.3,
-        contactEquationStiffness: 1e7, contactEquationRelaxation: 3
+      const cm = (a, b, friction, restitution) => world.addContactMaterial(new CANNON.ContactMaterial(a, b, {
+        friction, restitution, contactEquationStiffness: 1e7, contactEquationRelaxation: 3
       }));
-      world.addContactMaterial(new CANNON.ContactMaterial(wood, grass, {
-        friction: 0.6, restitution: 0.12,
-        contactEquationStiffness: 1e7, contactEquationRelaxation: 3
-      }));
+      cm(pinWood, pinWood, WOOD_FRICTION, WOOD_RESTITUTION);
+      cm(pinWood, stickWood, WOOD_FRICTION, WOOD_RESTITUTION);
+      cm(pinWood, grass, PIN_GRASS_FRICTION, 0.12);
+      cm(stickWood, grass, STICK_GRASS_FRICTION, 0.12);
 
       // Sol
       const ground = new CANNON.Body({ mass: 0, material: grass });
@@ -198,7 +202,7 @@
       }
 
       function makePin(x, z, yaw) {
-        const b = new CANNON.Body({ mass: PIN_MASS, material: wood });
+        const b = new CANNON.Body({ mass: PIN_MASS, material: pinWood });
         b.addShape(PIN_SHAPE);
         b.collisionFilterGroup = G_PIN;
         b.collisionFilterMask = G_GROUND | G_PIN | G_STICK;
@@ -212,13 +216,14 @@
 
       // Bâton : vrai cylindre (le cylindre de cannon est déjà dans l'axe Z, comme le bâton)
       function makeStick(x, z, yaw) {
-        const b = new CANNON.Body({ mass: STICK_MASS, material: wood });
+        const b = new CANNON.Body({ mass: STICK_MASS, material: stickWood });
         b.addShape(new CANNON.Cylinder(STICK_R, STICK_R, STICK_LEN, 16));
         b.collisionFilterGroup = G_STICK;
-        tune(b, 0.01, 0.85);             // presque pas de frein dans l'air ; au sol, l'herbe freine le roulement
+        tune(b, 0.01, 0.2);              // freinage géré à chaque pas dans step() (résistance au roulement)
         b.position.set(x, STICK_R, z);
         b.quaternion.setFromAxisAngle(UP, yaw);
         world.addBody(b);
+        stickBodies.push(b);
         setStickHeld(b, false);
         b.sleep();
         return b;
@@ -250,12 +255,20 @@
 
       // Une quille couchée roule dans l'herbe : on la freine fort au roulement.
       // Une quille debout ou en train de basculer garde un freinage léger (chute vive).
-      const pinBodies = [];
+      const pinBodies = [], stickBodies = [];
       function step(dt) {
         for (const b of pinBodies) {
           const lying = upVector(b).y < 0.3;
           b.angularDamping = lying ? 0.85 : 0.35;
           b.linearDamping = lying ? 0.3 : 0.05;
+        }
+        // Bâton au sol : il roule librement tant qu'il va vite (il peut encore
+        // faucher les quilles), et l'herbe ne l'arrête vraiment qu'en fin de course.
+        for (const b of stickBodies) {
+          const onGround = b.position.y < STICK_R + 0.01;
+          const slow = b.velocity.norm() < 0.8;
+          b.angularDamping = onGround && slow ? 0.9 : 0.2;
+          b.linearDamping = onGround && slow ? 0.6 : 0.01;
         }
         world.step(FIXED_STEP, dt, MAX_SUBSTEPS);
       }

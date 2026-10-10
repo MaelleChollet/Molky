@@ -56,6 +56,9 @@
       shadow="receive: true">
     </a-plane>
 
+    <!-- Ligne de lancer (mölkkaari) -->
+    <a-box position="0 0.005 -0.35" width="0.9" height="0.01" depth="0.04" color="#f2efe6"></a-box>
+
     <!-- Les Quilles du Mölkky -->
     <a-entity id="pins"></a-entity>
 
@@ -202,6 +205,7 @@
         tune(b, 0.05, 0.35);             // freinage réduit : les quilles basculent plus vivement
         placeStanding(b, x, z, yaw);
         world.addBody(b);
+        pinBodies.push(b);
         b.sleep();
         return b;
       }
@@ -235,7 +239,24 @@
         }
       }
 
+      // Pendant un lancer, les quilles doivent rester éveillées : une quille "endormie"
+      // se comporte comme un mur au moment du choc et le bâton rebondit dessus.
+      function keepAwake(bodies, on) {
+        bodies.forEach(b => {
+          b.allowSleep = !on;
+          if (on) b.wakeUp();
+        });
+      }
+
+      // Une quille couchée roule dans l'herbe : on la freine fort au roulement.
+      // Une quille debout ou en train de basculer garde un freinage léger (chute vive).
+      const pinBodies = [];
       function step(dt) {
+        for (const b of pinBodies) {
+          const lying = upVector(b).y < 0.3;
+          b.angularDamping = lying ? 0.85 : 0.35;
+          b.linearDamping = lying ? 0.3 : 0.05;
+        }
         world.step(FIXED_STEP, dt, MAX_SUBSTEPS);
       }
 
@@ -314,22 +335,35 @@
         world,
         PIN_R, PIN_H, PIN_CUT, PIN_HM, PIN_COM_X, PIN_COM_Y, PIN_FACE_YAW,
         STICK_R, STICK_LEN,
-        makePin, makeStick, setStickHeld, step,
+        makePin, makeStick, setStickHeld, keepAwake, step,
         isFallen, basePos, standingPose, isStill, planRaise, placeStanding
       };
     })();
   </script>
 
   <script>
-    // Configuration du jeu : la quille 1 est à l'avant (z = -1.5), orientée vers le joueur en z = 0
-    const LAYOUT = [
-      [0, -1.50, 1],
-      [-0.15, -1.65, 2], [0.15, -1.65, 3],
-      [-0.30, -1.85, 4], [0, -1.80, 5], [0.30, -1.85, 6],
-      [-0.45, -2.05, 7], [-0.15, -2.00, 8], [0.15, -2.00, 9], [0.45, -2.05, 10],
-      [-0.60, -2.25, 11], [0.60, -2.25, 12]
-    ];
-    const STICK_START = { x: 0, z: -0.6, yaw: Math.PI / 2 };
+    // ===== Formation officielle de départ =====
+    // Quilles serrées les unes contre les autres, en 4 rangées (vu depuis le joueur, de gauche à droite) :
+    //           7  9  8
+    //         5  11 12  6
+    //           3  10  4
+    //             1  2          <- rangée la plus proche du joueur
+    // Le joueur (z = 0) lance depuis la ligne ; la formation est à 3,5 m.
+    const FORMATION_Z = -3.5;                        // rangée avant (1, 2)
+    const ROWS = [[1, 2], [3, 10, 4], [5, 11, 12, 6], [7, 9, 8]];
+    const LAYOUT = (() => {
+      const d = 2 * PHYS.PIN_R + 0.002;              // diamètre + 2 mm : elles se touchent presque
+      const rowStep = d * Math.sqrt(3) / 2;          // empilement en quinconce
+      const out = [];
+      ROWS.forEach((row, r) => {
+        row.forEach((num, i) => {
+          const x = (i - (row.length - 1) / 2) * d;
+          out.push([x, FORMATION_Z - r * rowStep, num]);
+        });
+      });
+      return out;
+    })();
+    const STICK_START = { x: 0.25, z: -0.15, yaw: Math.PI / 2 };   // bâton posé à côté du pied droit
 
     let pins = [];
 
@@ -716,6 +750,7 @@
         this.syncBodyFromStick();
 
         PHYS.setStickHeld(this.body, false);
+        PHYS.keepAwake(pins.map(p => p.body), true);
         this.body.velocity.set(this.vel.x, this.vel.y, this.vel.z);
         this.body.angularVelocity.set(this.spin.x, this.spin.y, this.spin.z);
 
@@ -737,6 +772,7 @@
       settle() {
         this.state = 'waiting';
         this.timer = 0;
+        PHYS.keepAwake(pins.map(p => p.body), false);
         pins.forEach(p => { p.fallen = PHYS.isFallen(p.body); });
         showResult(pins.filter(p => p.fallen));
         $('actionMsg').textContent = 'Les quilles se relèvent dans quelques secondes…';

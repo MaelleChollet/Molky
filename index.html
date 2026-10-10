@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Mölkky VR</title>
+  <script src="https://cdn.jsdelivr.net/npm/aframe@1.5.0/dist/aframe-master.min.js"></script>
+  <style>
+    :root { --panel: rgba(20, 16, 14, 0.85); --ink: #f4ecdf; }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0; width: 100%; height: 100%;
+      background: #000; color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      overflow: hidden;
+    }
+    .hud {
+      position: fixed; left: 0; right: 0; z-index: 10;
+      padding: 12px 16px; text-align: center; pointer-events: none;
+    }
+    .top { top: 0; background: linear-gradient(rgba(0,0,0,0.65), transparent); }
+    .bottom { bottom: 0; padding-bottom: calc(14px + env(safe-area-inset-bottom, 0)); }
+    .pill {
+      display: inline-block; background: var(--panel); border-radius: 20px;
+      padding: 8px 18px; font-size: 14px; border: 1px solid rgba(255,255,255,0.18);
+    }
+  </style>
+</head>
+<body>
+
+  <div class="hud top">
+    <div class="pill" id="statusMsg">Partie en cours</div>
+  </div>
+  <div class="hud bottom">
+    <div class="pill" id="actionMsg">Face à la quille 1</div>
+  </div>
+
+  <a-scene renderer="antialias: true; colorManagement: true" vr-mode-ui="enabled: true">
+    
+    <!-- Ciel -->
+    <a-sky color="#7ec0ee"></a-sky>
+
+    <!-- Éclairage extérieur -->
+    <a-entity light="type: ambient; color: #b0c4de; intensity: 0.7;"></a-entity>
+    <a-entity light="type: directional; color: #fff8eb; intensity: 1.1; position: 10 25 15; castShadow: true;"></a-entity>
+
+    <!-- Énorme sol carré (120m x 120m) -->
+    <a-plane 
+      rotation="-90 0 0" 
+      width="120" 
+      height="120" 
+      color="#3c733f" 
+      roughness="0.95" 
+      shadow="receive: true">
+    </a-plane>
+
+    <!-- Les Quilles du Mölkky -->
+    <a-entity id="pins"></a-entity>
+
+    <!-- Bâton de lancer (Mölkky) -->
+    <a-box 
+      id="stick" 
+      width="0.05" 
+      height="0.05" 
+      depth="0.38" 
+      color="#c98a4b" 
+      position="0 0.05 -0.6"
+      rotation="0 90 0">
+    </a-box>
+
+    <!-- Joueur (Camera Rig) -->
+    <a-entity id="rig" position="0 0 0" vr-stick-movement>
+    <!-- Position de la caméra axe Y -->
+    <a-entity id="cameraPitch" position="0 1 0">
+      <a-camera 
+        id="camera" 
+        position="0 0 0" 
+        look-controls="pointerLockEnabled: false" 
+        wasd-controls="acceleration: 25">
+        <a-cursor fuse="false" color="#ffffff" opacity="0.5" raycaster="objects: .clickable"></a-cursor>
+      </a-camera>
+    </a-entity>
+
+    <!-- Manette gauche : Déplacement (Stick) + Laser -->
+    <a-entity id="leftHand" 
+                laser-controls="hand: left" 
+                oculus-touch-controls="hand: left" 
+                windows-motion-controls="hand: left"
+                generic-tracked-controller-controls="hand: left">
+    </a-entity>
+
+    <!-- Manette droite : Rotation (Stick) + Laser -->
+    <a-entity id="rightHand" 
+                laser-controls="hand: right" 
+                oculus-touch-controls="hand: right" 
+                windows-motion-controls="hand: right"
+                generic-tracked-controller-controls="hand: right">
+    </a-entity>
+    </a-entity>
+
+  </a-scene>
+
+  <script>
+    // Configuration du jeu : la quille 1 est à l'avant (z = -1.5), orientée vers le joueur en z = 0
+    const LAYOUT = [
+      [0, -1.50, 1],
+      [-0.15, -1.65, 2], [0.15, -1.65, 3],
+      [-0.30, -1.85, 4], [0, -1.80, 5], [0.30, -1.85, 6],
+      [-0.45, -2.05, 7], [-0.15, -2.00, 8], [0.15, -2.00, 9], [0.45, -2.05, 10],
+      [-0.60, -2.25, 11], [0.60, -2.25, 12]
+    ];
+    const HIT_R = 0.16;
+    const STICK_START = { x: 0, y: 0.05, z: -0.6 };
+
+    let pins = [];
+    let stick = { vx: 0, vz: 0, moving: false, hits: new Set() };
+
+    const $ = id => document.getElementById(id);
+
+    AFRAME.registerComponent('vr-stick-movement', {
+    init: function () {
+        this.moveSpeed = 0.05;       // Vitesse de marche
+        this.turnSpeed = 90;         // Vitesse de rotation horizontale (degrés/seconde)
+        this.pitchSpeed = 70;        // Vitesse d'inclinaison verticale (degrés/seconde)
+        this.deadZone = 0.15;        // Zone morte pour éviter le drift
+        
+        this.moveAxes = [0, 0];      // [x, y] stick gauche
+        this.turnAxis = [0, 0];      // [x, y] stick droit
+
+        const leftHand = document.getElementById('leftHand');
+        const rightHand = document.getElementById('rightHand');
+        const cam = document.getElementById('camera');
+        this.cameraPitchEl = document.getElementById('cameraPitch');
+
+        // Écoute du joystick gauche (Déplacement)
+        leftHand.addEventListener('axismove', (e) => {
+        // Axes 2 et 3 correspondent aux sticks sur Meta Quest / WebXR
+        const x = e.detail.axis[2] !== undefined ? e.detail.axis[2] : e.detail.axis[0];
+        const y = e.detail.axis[3] !== undefined ? e.detail.axis[3] : e.detail.axis[1];
+        this.moveAxes[0] = Math.abs(x) > this.deadZone ? x : 0;
+        this.moveAxes[1] = Math.abs(y) > this.deadZone ? y : 0;
+        });
+
+        // Écoute du joystick droit (Rotation)
+        rightHand.addEventListener('axismove', (e) => {
+        const x = e.detail.axis[2] !== undefined ? e.detail.axis[2] : e.detail.axis[0];
+        const y = e.detail.axis[3] !== undefined ? e.detail.axis[3] : e.detail.axis[1];
+        this.turnAxis[0] = Math.abs(x) > this.deadZone ? x : 0;
+        this.turnAxis[1] = Math.abs(y) > this.deadZone ? y : 0;
+        });
+
+        this.camEl = cam;
+    },
+
+    tick: function (time, timeDelta) {
+      // Le stick droit tourne le rig horizontalement et incline la vue verticalement.
+      const delta = timeDelta / 1000;
+      if (this.turnAxis[0] !== 0) {
+      const rigRot = this.el.getAttribute('rotation');
+      rigRot.y -= this.turnAxis[0] * this.turnSpeed * delta;
+      this.el.setAttribute('rotation', rigRot);
+      }
+
+      if (this.turnAxis[1] !== 0) {
+      const pitchRot = this.cameraPitchEl.getAttribute('rotation');
+      pitchRot.x = THREE.MathUtils.clamp(
+        pitchRot.x + this.turnAxis[1] * this.pitchSpeed * delta,
+        -45,
+        45
+      );
+      this.cameraPitchEl.setAttribute('rotation', pitchRot);
+      }
+
+        // 2. Déplacement relatif à l'orientation du casque
+        if (this.moveAxes[0] !== 0 || this.moveAxes[1] !== 0) {
+        const rigPos = this.el.getAttribute('position');
+        
+        // Récupère l'orientation combinée (caméra + rig)
+        const camYRot = this.camEl.getAttribute('rotation').y;
+        const rigYRot = this.el.getAttribute('rotation').y;
+        const angleRad = THREE.MathUtils.degToRad(camYRot + rigYRot);
+
+        // Calcul des directions Forward et Right
+        const sin = Math.sin(angleRad);
+        const cos = Math.cos(angleRad);
+
+        const strafe = this.moveAxes[0] * this.moveSpeed;
+        const forward = this.moveAxes[1] * this.moveSpeed;
+
+        // Déplacement dans le plan horizontal X/Z
+        rigPos.x += strafe * cos + forward * sin;
+        rigPos.z += -strafe * sin + forward * cos;
+
+        this.el.setAttribute('position', rigPos);
+        }
+    }
+    });
+
+    // Support complet clavier ZQSD (en plus de WASD natif)
+    window.addEventListener('keydown', e => {
+      const wasd = $('camera').components['wasd-controls'];
+      if (!wasd) return;
+      const k = e.key.toLowerCase();
+      if (k === 'z') wasd.keys.KeyW = true;
+      if (k === 'q') wasd.keys.KeyA = true;
+      if (k === 's') wasd.keys.KeyS = true;
+      if (k === 'd') wasd.keys.KeyD = true;
+    });
+
+    window.addEventListener('keyup', e => {
+      const wasd = $('camera').components['wasd-controls'];
+      if (!wasd) return;
+      const k = e.key.toLowerCase();
+      if (k === 'z') wasd.keys.KeyW = false;
+      if (k === 'q') wasd.keys.KeyA = false;
+      if (k === 's') wasd.keys.KeyS = false;
+      if (k === 'd') wasd.keys.KeyD = false;
+    });
+
+    function buildPins() {
+      const wrap = $('pins');
+      wrap.innerHTML = '';
+      pins = [];
+
+      LAYOUT.forEach(([x, z, num]) => {
+        const h = 0.15 + (num * 0.01);
+        const g = document.createElement('a-entity');
+        g.setAttribute('position', `${x} 0 ${z}`);
+
+        const body = document.createElement('a-cylinder');
+        body.setAttribute('radius', 0.038);
+        body.setAttribute('height', h);
+        body.setAttribute('position', `0 ${h / 2} 0`);
+        body.setAttribute('color', '#dfb887');
+        body.setAttribute('roughness', '0.6');
+
+        const label = document.createElement('a-text');
+        label.setAttribute('value', num);
+        label.setAttribute('align', 'center');
+        label.setAttribute('color', '#2d1806');
+        label.setAttribute('width', 2);
+        label.setAttribute('position', `0 ${h + 0.03} 0`);
+        label.setAttribute('rotation', '-90 0 0');
+
+        g.appendChild(body);
+        g.appendChild(label);
+        wrap.appendChild(g);
+        pins.push({ el: g, x, z, num, standing: true });
+      });
+    }
+
+    buildPins();
+
+    function resetStick() {
+      stick.vx = 0; stick.vz = 0; stick.moving = false; stick.hits = new Set();
+      $('stick').setAttribute('position', { ...STICK_START });
+    }
+
+    function launchStick(aimX, powerZ) {
+      if (stick.moving) return;
+      stick.vx = aimX;
+      stick.vz = powerZ;
+      stick.moving = true;
+      stick.hits = new Set();
+      $('actionMsg').textContent = 'Lancé !';
+    }
+
+    // Déplacement et collisions
+    setInterval(() => {
+      if (!stick.moving) return;
+      const el = $('stick');
+      const pos = el.getAttribute('position');
+
+      pos.x += stick.vx * 0.05;
+      pos.z += stick.vz * 0.05;
+      stick.vx *= 0.94;
+      stick.vz *= 0.94;
+      el.setAttribute('position', pos);
+
+      pins.forEach(p => {
+        if (p.standing && !stick.hits.has(p.num)) {
+          const d = Math.hypot(pos.x - p.x, pos.z - p.z);
+          if (d < HIT_R) {
+            stick.hits.add(p.num);
+            knockPin(p);
+          }
+        }
+      });
+
+      const speed = Math.hypot(stick.vx, stick.vz);
+      if (speed < 0.02 || pos.z < -2.6 || Math.abs(pos.x) > 1.5) {
+        stick.moving = false;
+        finishThrow();
+      }
+    }, 16);
+
+    function knockPin(p) {
+      p.standing = false;
+      p.el.setAttribute('animation', 'property: rotation; to: -75 0 25; dur: 220; easing: easeOutQuad');
+    }
+
+    function standPin(p) {
+      p.standing = true;
+      p.el.setAttribute('animation', 'property: rotation; to: 0 0 0; dur: 260; easing: easeOutQuad');
+    }
+
+    function finishThrow() {
+      const n = stick.hits.size;
+      $('statusMsg').textContent = n > 0 ? `${n} quille${n > 1 ? 's' : ''} tombée${n > 1 ? 's' : ''} !` : 'Raté.';
+      setTimeout(() => {
+        pins.forEach(p => { if (!p.standing) standPin(p); });
+        resetStick();
+        setTimeout(() => $('actionMsg').textContent = "Face à la quille 1", 500);
+      }, 900);
+    }
+
+    // Lancer avec la gâchette des manettes VR
+    const leftController = $('leftHand');
+    const rightController = $('rightHand');
+
+    function handleVRTrigger() {
+    launchStick(0, -1.1);
+    }
+
+    // Événements gâchette A-Frame / WebXR
+    leftController.addEventListener('triggerdown', handleVRTrigger);
+    rightController.addEventListener('triggerdown', handleVRTrigger);
+
+    // Compatibilité supplémentaire pour le bouton de sélection WebXR
+    leftController.addEventListener('selectstart', handleVRTrigger);
+    rightController.addEventListener('selectstart', handleVRTrigger);
+  </script>
+</body>
+</html>

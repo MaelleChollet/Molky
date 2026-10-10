@@ -111,10 +111,10 @@
 
       // Dimensions et masses (bois de bouleau ≈ 650 kg/m³)
       const PIN_R = 0.038;
-      const PIN_MASS = 0.25;           // kg
+      const PIN_MASS = 0.21;           // kg
       const STICK_W = 0.05;
       const STICK_LEN = 0.38;
-      const STICK_MASS = 0.4;          // kg
+      const STICK_MASS = 0.34;         // kg
 
       const FIXED_STEP = 1 / 300;      // petit pas fixe : pas de barre qui traverse une quille
       const MAX_SUBSTEPS = 20;
@@ -457,10 +457,11 @@
     AFRAME.registerComponent('molkky-stick', {
       schema: {
         grabDist: { default: 0.7 },       // distance horizontale pour l'attraper (m)
-        returnDelay: { default: 2500 },   // attente avant de relever les quilles (ms)
-        boost: { default: 1.4 },          // multiplicateur de puissance du geste
-        maxSpeed: { default: 12 },        // vitesse maxi du lancer (m/s)
-        maxSpin: { default: 20 }          // rotation maxi de la barre (rad/s)
+        returnDelay: { default: 1800 },   // attente avant de relever les quilles (ms)
+        boost: { default: 1.15 },         // multiplicateur de puissance du geste
+        maxSpeed: { default: 10 },        // vitesse maxi du lancer (m/s)
+        spinScale: { default: 0.4 },      // part de la rotation du poignet transmise à la barre
+        maxSpin: { default: 10 }          // rotation maxi de la barre (rad/s)
       },
 
       init() {
@@ -498,12 +499,15 @@
 
         $('actionMsg').textContent = 'Attrape la barre au sol avec la main droite (gâchette)';
 
-        // La barre se joue uniquement avec la main droite
+        // La barre se joue uniquement avec la main droite.
+        // Gâchette OU grip : c'est le bouton qui a attrapé la barre qui la lâche.
+        this.pressed = { trigger: false, grip: false };
+        this.holdButton = null;
         const h = $('rightHand');
-        h.addEventListener('triggerdown', () => this.onDown(h));
-        h.addEventListener('triggerup', () => this.onUp(h));
-        h.addEventListener('gripdown', () => this.onDown(h));
-        h.addEventListener('gripup', () => this.onUp(h));
+        h.addEventListener('triggerdown', () => this.onDown(h, 'trigger'));
+        h.addEventListener('triggerup', () => this.onUp(h, 'trigger'));
+        h.addEventListener('gripdown', () => this.onDown(h, 'grip'));
+        h.addEventListener('gripup', () => this.onUp(h, 'grip'));
       },
 
       syncStickFromBody() {
@@ -518,8 +522,9 @@
       },
 
       // ----- 1. Attraper / tenir la barre -----
-      onDown(h) {
-        this.history.length = 0;
+      onDown(h, button) {
+        this.pressed[button] = true;
+        if (this.state === 'holding') return;              // déjà en main : on ignore l'autre bouton
         if (this.state === 'ground') {
           h.object3D.getWorldPosition(this.tmp);
           const s = this.el.object3D.position;
@@ -530,16 +535,24 @@
           this.handVel.set(0, 0, 0);
           this.handAng.set(0, 0, 0);
           PHYS.setStickHeld(this.body, true);
-          this.state = 'holding';
-          $('actionMsg').textContent = 'Balance le bras et relâche la gâchette pour lancer !';
+          this.startHolding(button);
         } else if (this.state === 'ready' && h === this.hand) {
-          this.state = 'holding';
-          $('actionMsg').textContent = 'Balance le bras et relâche la gâchette pour lancer !';
+          this.startHolding(button);
         }
+        // Pendant le retour de la barre, l'appui est mémorisé :
+        // si le bouton est encore enfoncé à l'arrivée, la barre est directement en main.
       },
 
-      onUp(h) {
-        if (this.state === 'holding' && h === this.hand) this.throwStick();
+      onUp(h, button) {
+        this.pressed[button] = false;
+        if (this.state === 'holding' && h === this.hand && button === this.holdButton) this.throwStick();
+      },
+
+      startHolding(button) {
+        this.history.length = 0;
+        this.holdButton = button;
+        this.state = 'holding';
+        $('actionMsg').textContent = 'Balance le bras et relâche le bouton pour lancer !';
       },
 
       // Lit la main : position, vitesse, vitesse de rotation, direction horizontale
@@ -565,7 +578,7 @@
           this.handAng.lerp(this.tmp, 0.4);
 
           this.history.push({ v: this.handVel.clone(), w: this.handAng.clone() });
-          if (this.history.length > 10) this.history.shift();
+          if (this.history.length > 8) this.history.shift();       // ≈ 0,1 s avant le lâcher
         }
         this.handPrev.copy(this.handPos);
         this.handQuatPrev.copy(this.handQuat);
@@ -607,7 +620,9 @@
         this.spin.set(0, 0, 0);
         if (best) {
           this.vel.copy(best.v).multiplyScalar(this.data.boost);
-          this.spin.copy(best.w);
+          // Le bras qui balance fait beaucoup tourner la manette : on n'en garde qu'une partie,
+          // sinon la barre part en vrille et rebondit n'importe comment.
+          this.spin.copy(best.w).multiplyScalar(this.data.spinScale);
         }
         const sp = this.vel.length();
         if (sp > this.data.maxSpeed) this.vel.multiplyScalar(this.data.maxSpeed / sp);
@@ -618,6 +633,9 @@
         const hs = Math.hypot(this.vel.x, this.vel.z);
         if (hs > 0.3) this.yaw = Math.atan2(this.vel.z, -this.vel.x);
         this.el.object3D.quaternion.setFromAxisAngle(UP, this.yaw);
+        // Lâchée main près du sol : la barre ne doit pas démarrer dans l'herbe (sinon elle est éjectée)
+        const o = this.el.object3D;
+        o.position.y = Math.max(o.position.y, PHYS.STICK_W / 2 + 0.01);
         this.syncBodyFromStick();
 
         PHYS.setStickHeld(this.body, false);
@@ -707,9 +725,15 @@
         o.quaternion.copy(this.fromQuat).slerp(this.toQuat, e);
         this.syncBodyFromStick();
         if (this.t >= 1) {
-          this.state = 'ready';
           $('statusMsg').textContent = 'Partie en cours';
-          $('actionMsg').textContent = 'Barre en main : maintiens la gâchette, puis relâche en lançant';
+          // Bouton déjà enfoncé pendant le retour : la barre est directement en main
+          const held = this.pressed.trigger ? 'trigger' : (this.pressed.grip ? 'grip' : null);
+          if (held) {
+            this.startHolding(held);
+          } else {
+            this.state = 'ready';
+            $('actionMsg').textContent = 'Barre en main : maintiens la gâchette, puis relâche en lançant';
+          }
         }
       },
 

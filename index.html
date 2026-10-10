@@ -60,14 +60,11 @@
     <a-entity id="pins"></a-entity>
 
     <!-- Bâton de lancer (Mölkky) : long axe = axe Z local -->
-    <a-box
-      id="stick"
-      molkky-stick
-      width="0.05"
-      height="0.05"
-      depth="0.38"
-      color="#c98a4b">
-    </a-box>
+    <a-entity id="stick" molkky-stick>
+      <!-- cylindre de 22,5 cm × Ø 5,9 cm, couché dans l'axe Z -->
+      <a-cylinder radius="0.0295" height="0.225" segments-radial="24"
+                  rotation="90 0 0" color="#c98a4b" roughness="0.6"></a-cylinder>
+    </a-entity>
 
     <!-- Joueur (Camera Rig) -->
     <a-entity id="rig" position="0 0 0" vr-stick-movement>
@@ -109,12 +106,25 @@
       // Groupes de collision
       const G_GROUND = 1, G_PIN = 2, G_STICK = 4;
 
-      // Dimensions et masses (bois de bouleau ≈ 650 kg/m³)
-      const PIN_R = 0.038;
+      // Dimensions officielles du Mölkky (bouleau)
+      //   quilles : 15 cm de haut, Ø 5,9 cm, base plate, sommet biseauté à 45°
+      //   bâton   : 22,5 cm de long, Ø 5,9 cm
+      const PIN_R = 0.0295;
+      const PIN_H = 0.15;              // hauteur du côté le plus haut
+      const PIN_CUT = Math.tan(45 * Math.PI / 180);   // pente du biseau
+      const PIN_HM = PIN_H - PIN_R * PIN_CUT;         // hauteur au centre du biseau
       const PIN_MASS = 0.17;           // kg
-      const STICK_W = 0.05;
-      const STICK_LEN = 0.38;
+      const PIN_SEG = 14;              // facettes de la forme physique
+      const STICK_R = 0.0295;
+      const STICK_LEN = 0.225;
       const STICK_MASS = 0.34;         // kg
+
+      // Centre de gravité de la quille biseautée, mesuré depuis le centre de la base.
+      // Le biseau monte vers +x : le haut de la quille est en x = +r.
+      const PIN_COM_Y = (PIN_HM * PIN_HM + PIN_CUT * PIN_CUT * PIN_R * PIN_R / 4) / (2 * PIN_HM);
+      const PIN_COM_X = PIN_CUT * PIN_R * PIN_R / (4 * PIN_HM);
+      // Orientation de départ : la face biseautée (et son numéro) regarde les joueurs (+z)
+      const PIN_FACE_YAW = Math.PI / 2;
 
       const FIXED_STEP = 1 / 300;      // petit pas fixe : pas de barre qui traverse une quille
       const MAX_SUBSTEPS = 20;
@@ -147,9 +157,33 @@
       world.addBody(ground);
 
       const UP = new CANNON.Vec3(0, 1, 0);
-      const Z_TO_Y = new CANNON.Quaternion();
-      Z_TO_Y.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2); // le cylindre de cannon est sur Z
       const tmp = new CANNON.Vec3();
+      const BASE_LOCAL = new CANNON.Vec3(-PIN_COM_X, -PIN_COM_Y, 0);   // centre de la base, repère quille
+
+      // Forme physique de la quille : cylindre à sommet biseauté, centré sur son centre de gravité
+      function makePinShape() {
+        const v = [];
+        for (let i = 0; i < PIN_SEG; i++) {                 // anneau du bas
+          const a = 2 * Math.PI * i / PIN_SEG;
+          v.push(new CANNON.Vec3(PIN_R * Math.cos(a) - PIN_COM_X, -PIN_COM_Y, PIN_R * Math.sin(a)));
+        }
+        for (let i = 0; i < PIN_SEG; i++) {                 // anneau du haut, en pente
+          const a = 2 * Math.PI * i / PIN_SEG;
+          const x = PIN_R * Math.cos(a);
+          v.push(new CANNON.Vec3(x - PIN_COM_X, PIN_HM + PIN_CUT * x - PIN_COM_Y, PIN_R * Math.sin(a)));
+        }
+        const f = [];
+        const bottom = [], top = [];
+        for (let i = 0; i < PIN_SEG; i++) {
+          const j = (i + 1) % PIN_SEG;
+          f.push([i, PIN_SEG + i, PIN_SEG + j, j]);         // côtés
+          bottom.push(i);
+          top.unshift(PIN_SEG + i);
+        }
+        f.push(bottom, top);
+        return new CANNON.ConvexPolyhedron(v, f);
+      }
+      const PIN_SHAPE = makePinShape();
 
       function tune(b, linDamp, angDamp) {
         b.linearDamping = linDamp;       // un peu de résistance de l'air / de l'herbe
@@ -159,24 +193,25 @@
         b.sleepTimeLimit = 0.4;
       }
 
-      function makePin(x, z, h) {
+      function makePin(x, z, yaw) {
         const b = new CANNON.Body({ mass: PIN_MASS, material: wood });
-        b.addShape(new CANNON.Cylinder(PIN_R, PIN_R, h, 16), new CANNON.Vec3(), Z_TO_Y);
+        b.addShape(PIN_SHAPE);
         b.collisionFilterGroup = G_PIN;
         b.collisionFilterMask = G_GROUND | G_PIN | G_STICK;
         tune(b, 0.05, 0.35);             // freinage réduit : les quilles basculent plus vivement
-        b.position.set(x, h / 2, z);
+        placeStanding(b, x, z, yaw);
         world.addBody(b);
         b.sleep();
         return b;
       }
 
+      // Bâton : vrai cylindre (le cylindre de cannon est déjà dans l'axe Z, comme le bâton)
       function makeStick(x, z, yaw) {
         const b = new CANNON.Body({ mass: STICK_MASS, material: wood });
-        b.addShape(new CANNON.Box(new CANNON.Vec3(STICK_W / 2, STICK_W / 2, STICK_LEN / 2)));
+        b.addShape(new CANNON.Cylinder(STICK_R, STICK_R, STICK_LEN, 16));
         b.collisionFilterGroup = G_STICK;
-        tune(b, 0.05, 0.4);
-        b.position.set(x, STICK_W / 2, z);
+        tune(b, 0.05, 0.85);             // un cylindre roule : l'herbe le freine vite
+        b.position.set(x, STICK_R, z);
         b.quaternion.setFromAxisAngle(UP, yaw);
         world.addBody(b);
         setStickHeld(b, false);
@@ -212,15 +247,18 @@
       }
 
       // Centre de la base de la quille, projeté au sol
-      function basePos(b, h) {
-        const up = upVector(b);
-        return { x: b.position.x - up.x * h / 2, z: b.position.z - up.z * h / 2 };
+      function basePos(b) {
+        const w = b.quaternion.vmult(BASE_LOCAL, tmp);
+        return { x: b.position.x + w.x, z: b.position.z + w.z };
       }
 
-      // Direction horizontale vers laquelle la quille est tombée (pour garder son orientation)
-      function fallYaw(b) {
-        const up = upVector(b);
-        return Math.atan2(up.x, up.z);
+      // Position / orientation d'une quille debout dont la base est en (x, z)
+      function standingPose(x, z, yaw) {
+        const quat = new CANNON.Quaternion();
+        quat.setFromAxisAngle(UP, yaw);
+        const off = quat.vmult(BASE_LOCAL);
+        const pos = new CANNON.Vec3(x - off.x, -off.y, z - off.z);
+        return { pos, quat };
       }
 
       // Tout est-il immobile ?
@@ -237,7 +275,7 @@
       function planRaise(pins) {
         const MIN_D = 2 * PIN_R + 0.004;
         const pts = pins.map(p => {
-          const s = basePos(p.body, p.h);
+          const s = basePos(p.body);
           return { x: s.x, z: s.z, movable: p.fallen };
         });
         for (let it = 0; it < 30; it++) {
@@ -263,17 +301,20 @@
       }
 
       // Pose une quille debout, immobile
-      function placeStanding(b, h, x, z, yaw) {
-        b.position.set(x, h / 2, z);
-        b.quaternion.setFromAxisAngle(UP, yaw);
+      function placeStanding(b, x, z, yaw) {
+        const s = standingPose(x, z, yaw);
+        b.position.copy(s.pos);
+        b.quaternion.copy(s.quat);
         b.velocity.set(0, 0, 0);
         b.angularVelocity.set(0, 0, 0);
       }
 
       return {
-        world, PIN_R, STICK_W,
+        world,
+        PIN_R, PIN_H, PIN_CUT, PIN_HM, PIN_COM_X, PIN_COM_Y, PIN_FACE_YAW,
+        STICK_R, STICK_LEN,
         makePin, makeStick, setStickHeld, step,
-        isFallen, basePos, fallYaw, isStill, planRaise, placeStanding
+        isFallen, basePos, standingPose, isStill, planRaise, placeStanding
       };
     })();
   </script>
@@ -400,35 +441,56 @@
     });
 
     // ===== Quilles (visuel + corps physique) =====
+
+    // Géométrie d'une quille officielle : cylindre à base plate, sommet coupé en biseau à 45°.
+    // Centrée sur le centre de gravité, comme le corps physique.
+    function makePinGeometry() {
+      const g = new THREE.CylinderGeometry(PHYS.PIN_R, PHYS.PIN_R, 1, 32, 1);
+      const pos = g.attributes.position;
+      for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i);
+        const y = pos.getY(i) > 0 ? PHYS.PIN_HM + PHYS.PIN_CUT * x : 0;   // haut en pente, bas à plat
+        pos.setXYZ(i, x - PHYS.PIN_COM_X, y - PHYS.PIN_COM_Y, pos.getZ(i));
+      }
+      g.computeVertexNormals();
+      return g;
+    }
+    let PIN_GEOMETRY = null;
+
     function buildPins() {
       const wrap = $('pins');
       wrap.innerHTML = '';
       pins = [];
+      if (!PIN_GEOMETRY) PIN_GEOMETRY = makePinGeometry();
+      const material = new THREE.MeshStandardMaterial({ color: '#dfb887', roughness: 0.6 });
+
+      // Centre de la face biseautée, et inclinaison de cette face
+      const faceAngle = Math.atan(PHYS.PIN_CUT);                 // 45°
+      const nx = -Math.sin(faceAngle), ny = Math.cos(faceAngle);  // normale de la face
+      const fx = -PHYS.PIN_COM_X + nx * 0.001;
+      const fy = PHYS.PIN_HM - PHYS.PIN_COM_Y + ny * 0.001;
 
       LAYOUT.forEach(([x, z, num]) => {
-        const h = 0.15 + (num * 0.01);
-        // L'origine du groupe = le centre de la quille (comme le corps physique)
+        // L'origine du groupe = le centre de gravité de la quille (comme le corps physique)
         const g = document.createElement('a-entity');
+        g.setObject3D('mesh', new THREE.Mesh(PIN_GEOMETRY, material));
 
-        const body = document.createElement('a-cylinder');
-        body.setAttribute('radius', PHYS.PIN_R);
-        body.setAttribute('height', h);
-        body.setAttribute('color', '#dfb887');
-        body.setAttribute('roughness', '0.6');
-
+        // Le numéro est inscrit sur la face biseautée
+        const face = document.createElement('a-entity');
+        face.setAttribute('position', `${fx} ${fy} 0`);
+        face.setAttribute('rotation', `0 0 ${THREE.MathUtils.radToDeg(faceAngle)}`);
         const label = document.createElement('a-text');
         label.setAttribute('value', num);
         label.setAttribute('align', 'center');
         label.setAttribute('color', '#2d1806');
-        label.setAttribute('width', 2);
-        label.setAttribute('position', `0 ${h / 2 + 0.002} 0`);   // posé sur le dessus
-        label.setAttribute('rotation', '-90 0 0');
+        label.setAttribute('width', 1.4);
+        label.setAttribute('rotation', '-90 -90 0');             // à plat, lisible depuis le bas de la pente
+        face.appendChild(label);
 
-        g.appendChild(body);
-        g.appendChild(label);
+        g.appendChild(face);
         wrap.appendChild(g);
 
-        pins.push({ el: g, num, h, body: PHYS.makePin(x, z, h), fallen: false });
+        pins.push({ el: g, num, body: PHYS.makePin(x, z, PHYS.PIN_FACE_YAW), fallen: false });
       });
     }
 
@@ -635,7 +697,7 @@
         this.el.object3D.quaternion.setFromAxisAngle(UP, this.yaw);
         // Lâchée main près du sol : la barre ne doit pas démarrer dans l'herbe (sinon elle est éjectée)
         const o = this.el.object3D;
-        o.position.y = Math.max(o.position.y, PHYS.STICK_W / 2 + 0.01);
+        o.position.y = Math.max(o.position.y, PHYS.STICK_R + 0.01);
         this.syncBodyFromStick();
 
         PHYS.setStickHeld(this.body, false);
@@ -674,11 +736,13 @@
         this.raise = [];
         pins.forEach((p, i) => {
           if (!p.fallen) return;
-          const yaw = PHYS.fallYaw(p.body);
-          const to = new THREE.Vector3(targets[i].x, p.h / 2, targets[i].z);
-          const toQ = new THREE.Quaternion().setFromAxisAngle(UP, yaw);
+          // Relevée à l'endroit de sa base, numéro tourné vers les joueurs
+          const x = targets[i].x, z = targets[i].z, yaw = PHYS.PIN_FACE_YAW;
+          const pose = PHYS.standingPose(x, z, yaw);
+          const to = new THREE.Vector3(pose.pos.x, pose.pos.y, pose.pos.z);
+          const toQ = new THREE.Quaternion(pose.quat.x, pose.quat.y, pose.quat.z, pose.quat.w);
           this.raise.push({
-            p, yaw, to, toQ,
+            p, x, z, yaw, to, toQ,
             from: new THREE.Vector3().copy(p.body.position),
             fromQ: new THREE.Quaternion().copy(p.body.quaternion)
           });
@@ -698,7 +762,7 @@
         if (this.t < 1) return;
 
         this.raise.forEach(r => {
-          PHYS.placeStanding(r.p.body, r.p.h, r.to.x, r.to.z, r.yaw);
+          PHYS.placeStanding(r.p.body, r.x, r.z, r.yaw);
           r.p.fallen = false;
         });
         // On réveille tout le monde : une quille qui s'appuyait sur une autre retombe naturellement
